@@ -26,8 +26,8 @@ Railway automatically provides:
 - `PORT` - The port your app should listen on (automatically configured)
 
 You can add custom environment variables in Railway dashboard if needed:
-- `ENV=production` (optional)
 - `OMP_NUM_THREADS=2` (optional, for performance tuning)
+- `MALLOC_ARENA_MAX=2` (optional, for memory optimization)
 
 ### Build Time
 The first build will take longer because it needs to:

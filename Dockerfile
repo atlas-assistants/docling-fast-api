@@ -11,10 +11,11 @@ RUN apt-get update \
 RUN pip install poetry \
     && poetry config virtualenvs.create false
 
-COPY pyproject.toml poetry.lock ./
+COPY pyproject.toml ./
 
-# Install dependencies
-RUN poetry install --no-interaction --no-root
+# Generate lock file and install dependencies
+RUN poetry lock --no-interaction && \
+    poetry install --no-interaction --no-root
 
 # Install PyTorch CPU-only
 RUN pip install --no-cache-dir torch torchvision --extra-index-url https://download.pytorch.org/whl/cpu
