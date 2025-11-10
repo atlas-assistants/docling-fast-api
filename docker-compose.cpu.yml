@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  app:
+    container_name: docling-api
+    build:
+      context: .
+    image: docling-api-image
+    command: poetry run uvicorn --port 8080 --host 0.0.0.0 main:app
+    environment:
+      - ENV=production
+      - MALLOC_ARENA_MAX=2
+      - OMP_NUM_THREADS=2
+      - PYTHONMALLOC=malloc
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+      - model_cache:/tmp
+    restart: on-failure
+
+volumes:
+  model_cache:
