@@ -30,12 +30,15 @@ You can add custom environment variables in Railway dashboard if needed:
 - `MALLOC_ARENA_MAX=2` (optional, for memory optimization)
 
 ### Build Time
-The first build will take longer because it needs to:
-- Download PyTorch CPU version
-- Download Docling models
-- Download EasyOCR models
+**Build time is now optimized!** The Docker build should complete in 2-5 minutes because:
+- PyTorch is installed during build (cached for subsequent builds)
+- Models are downloaded at runtime on first use (not during build)
 
-Subsequent builds will be faster due to Docker layer caching.
+**First API call will be slower** (30-60 seconds) because models download on first use:
+- Docling pipeline models (~500MB)
+- EasyOCR language models (as needed)
+
+Subsequent API calls will be fast since models are cached in memory.
 
 ### Deployment Methods
 
@@ -59,13 +62,28 @@ After deployment:
 
 ## Troubleshooting
 
-If you encounter memory issues:
-1. Increase Railway plan memory
+### Build Getting Stuck at "Exporting to Docker Image"
+**SOLVED!** The Dockerfile has been optimized to avoid this issue:
+- Models are no longer pre-downloaded during build
+- Image size is much smaller
+- Build completes in 2-5 minutes instead of timing out
+
+### Memory Issues
+If you encounter memory issues during API calls:
+1. Increase Railway plan memory (recommend 2GB+)
 2. Reduce `OMP_NUM_THREADS` environment variable
 3. Consider processing smaller documents
 
-If build fails:
-- Check Railway build logs
+### Build Failures
+If build still fails:
+- Check Railway build logs for specific errors
 - Ensure all dependencies are in `pyproject.toml`
 - Verify Dockerfile syntax
+- Check if Railway has sufficient disk space during build
+
+### First Request Timeout
+If first API request times out:
+- This is normal - models are downloading (~500MB)
+- Increase Railway timeout settings if needed
+- Subsequent requests will be fast
 
