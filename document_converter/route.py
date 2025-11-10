@@ -8,9 +8,21 @@ from document_converter.utils import is_file_format_supported
 
 router = APIRouter()
 
-# Could be docling or another converter as long as it implements DocumentConversionBase
-converter = DoclingDocumentConversion()
-document_converter_service = DocumentConverterService(document_converter=converter)
+# Lazy initialization - only create converter when needed (not at import time)
+_converter = None
+_service = None
+
+def get_converter():
+    global _converter
+    if _converter is None:
+        _converter = DoclingDocumentConversion()
+    return _converter
+
+def get_service():
+    global _service
+    if _service is None:
+        _service = DocumentConverterService(document_converter=get_converter())
+    return _service
 
 
 # Document direct conversion endpoints
@@ -29,7 +41,7 @@ async def convert_single_document(
     if not is_file_format_supported(file_bytes, document.filename):
         raise HTTPException(status_code=400, detail=f"Unsupported file format: {document.filename}")
 
-    return document_converter_service.convert_document(
+    return get_service().convert_document(
         (document.filename, BytesIO(file_bytes)),
         extract_tables=extract_tables_as_images,
         image_resolution_scale=image_resolution_scale,
@@ -54,7 +66,7 @@ async def convert_multiple_documents(
             raise HTTPException(status_code=400, detail=f"Unsupported file format: {document.filename}")
         doc_streams.append((document.filename, BytesIO(file_bytes)))
 
-    return document_converter_service.convert_documents(
+    return get_service().convert_documents(
         doc_streams,
         extract_tables=extract_tables_as_images,
         image_resolution_scale=image_resolution_scale,
