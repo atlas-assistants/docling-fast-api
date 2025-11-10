@@ -7,14 +7,12 @@ RUN apt-get update \
     && apt-get install -y libgl1 libglib2.0-0 curl wget git procps \
     && apt-get clean
 
-# Install Poetry and configure it
-RUN pip install poetry \
-    && poetry config virtualenvs.create false
+# Copy requirements and install dependencies
+COPY pyproject.toml ./
 
-COPY pyproject.toml poetry.lock ./
-
-# Install dependencies
-RUN poetry install --no-interaction --no-root
+# Install dependencies directly with pip (simpler than Poetry)
+RUN pip install --upgrade pip && \
+    pip install fastapi==0.115.4 uvicorn==0.32.0 docling==2.25.1 python-multipart==0.0.17
 
 # Install PyTorch CPU-only
 RUN pip install --no-cache-dir torch torchvision --extra-index-url https://download.pytorch.org/whl/cpu
@@ -36,4 +34,4 @@ COPY . .
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["sh", "-c", "poetry run uvicorn --port ${PORT:-8080} --host 0.0.0.0 main:app"]
+CMD ["sh", "-c", "uvicorn --port ${PORT:-8080} --host 0.0.0.0 main:app"]
