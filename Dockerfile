@@ -32,6 +32,8 @@ RUN python -c 'import easyocr; \
 
 COPY . .
 
+# Railway provides PORT environment variable
+ENV PORT=8080
 EXPOSE 8080
 
-CMD ["poetry", "run", "uvicorn", "--port", "8080", "--host", "0.0.0.0", "main:app"]
+CMD ["sh", "-c", "poetry run uvicorn --port ${PORT:-8080} --host 0.0.0.0 main:app"]
