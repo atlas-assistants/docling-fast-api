@@ -1,9 +1,10 @@
+import os
 from io import BytesIO
 from typing import List
 from fastapi import APIRouter, File, HTTPException, UploadFile, Query
 
 from document_converter.schema import ConversionResult
-from document_converter.service import DocumentConverterService, DoclingDocumentConversion
+from document_converter.service import DocumentConverterService, DoclingDocumentConversion, DEFAULT_IDLE_TIMEOUT_SECONDS
 from document_converter.utils import is_file_format_supported
 
 router = APIRouter()
@@ -15,7 +16,9 @@ _service = None
 def get_converter():
     global _converter
     if _converter is None:
-        _converter = DoclingDocumentConversion()
+        # Get idle timeout from environment variable (default: 5 minutes)
+        idle_timeout = int(os.getenv("MODEL_IDLE_TIMEOUT_SECONDS", DEFAULT_IDLE_TIMEOUT_SECONDS))
+        _converter = DoclingDocumentConversion(idle_timeout_seconds=idle_timeout)
     return _converter
 
 def get_service():
