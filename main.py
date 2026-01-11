@@ -1,5 +1,8 @@
 from contextlib import asynccontextmanager
 
+import os
+import ctypes
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -17,6 +20,20 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+@app.middleware("http")
+async def malloc_trim_middleware(request, call_next):
+    response = await call_next(request)
+    # Optional: try to return freed heap memory back to OS after requests.
+    # This can help RSS drop closer to cold-start baseline over time.
+    if os.getenv("ENABLE_MALLOC_TRIM", "0").lower() in ("1", "true", "yes", "y", "on"):
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            if hasattr(libc, "malloc_trim"):
+                libc.malloc_trim(0)
+        except Exception:
+            pass
+    return response
 
 
 app.add_middleware(
