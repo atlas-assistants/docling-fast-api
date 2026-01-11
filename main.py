@@ -1,4 +1,3 @@
-import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -13,7 +12,7 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown: cleanup converters to free memory
     converter = get_converter()
-    if hasattr(converter, 'cleanup_all'):
+    if converter is not None and hasattr(converter, 'cleanup_all'):
         converter.cleanup_all()
 
 

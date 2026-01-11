@@ -1,9 +1,15 @@
 import base64
 import gc
 import logging
+import os
+import json
+import subprocess
+import sys
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from io import BytesIO
+from pathlib import Path
 from typing import List, Tuple, Optional
 from threading import Lock, Timer
 
@@ -22,6 +28,12 @@ IMAGE_RESOLUTION_SCALE = 4
 # Default idle timeout: 5 minutes (300 seconds)
 # Models will be unloaded after this period of inactivity
 DEFAULT_IDLE_TIMEOUT_SECONDS = 300
+
+# Conversion mode:
+# - "inprocess": run Docling in the API process (fast warm calls, hard to reliably free RSS)
+# - "process": run Docling in a short-lived worker subprocess (serverless-like memory reclaim)
+DEFAULT_CONVERSION_MODE = "inprocess"
+DEFAULT_WORKER_TIMEOUT_SECONDS = 300
 
 
 class DocumentConversionBase(ABC):
@@ -92,19 +104,40 @@ class DoclingDocumentConversion(DocumentConversionBase):
         with self._lock:
             # Double-check after acquiring lock
             if cache_key not in self._doc_converters:
-                logging.info(f"Loading ML models for converter (cache_key: {cache_key})")
+                memory_before = self._get_memory_usage_mb()
+                logging.info(f"Loading ML models for converter (cache_key: {cache_key}). Memory before: {memory_before:.1f}MB")
                 self._doc_converters[cache_key] = DocumentConverter(
                     format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
                 )
                 self._last_used[cache_key] = current_time
-                logging.info("ML models loaded into memory")
+                memory_after = self._get_memory_usage_mb()
+                memory_used = memory_after - memory_before
+                logging.info(f"ML models loaded into memory. Memory after: {memory_after:.1f}MB (used: {memory_used:.1f}MB)")
         
         return self._doc_converters[cache_key]
+    
+    def _get_memory_usage_mb(self) -> float:
+        """Get current memory usage in MB."""
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            return process.memory_info().rss / 1024 / 1024
+        except (ImportError, Exception):
+            # Fallback: try to read from /proc/self/status on Linux
+            try:
+                with open('/proc/self/status', 'r') as f:
+                    for line in f:
+                        if line.startswith('VmRSS:'):
+                            return float(line.split()[1]) / 1024  # Convert KB to MB
+            except (FileNotFoundError, Exception):
+                pass
+            return 0.0
     
     def _cleanup_idle_converters(self):
         """Remove converters that have been idle for longer than the timeout."""
         current_time = time.time()
         idle_keys = []
+        memory_before = self._get_memory_usage_mb()
         
         with self._lock:
             for cache_key, last_used in list(self._last_used.items()):
@@ -112,27 +145,111 @@ class DoclingDocumentConversion(DocumentConversionBase):
                 if idle_duration > self._idle_timeout:
                     idle_keys.append(cache_key)
             
-            # Remove idle converters
+            # Remove idle converters and try to explicitly clean up their internal state
             for cache_key in idle_keys:
                 if cache_key in self._doc_converters:
+                    converter = self._doc_converters[cache_key]
+                    idle_duration = current_time - self._last_used[cache_key]
+                    
+                    # Try to explicitly clean up converter's internal state
+                    try:
+                        # Docling converters may have internal pipeline objects
+                        if hasattr(converter, '_pipelines'):
+                            converter._pipelines.clear()
+                        if hasattr(converter, '_format_options'):
+                            # Clear format options which may hold model references
+                            for fmt_option in converter._format_options.values():
+                                if hasattr(fmt_option, 'pipeline_options'):
+                                    pipeline_opts = fmt_option.pipeline_options
+                                    # Try to clear OCR reader if it exists
+                                    if hasattr(pipeline_opts, 'ocr_options') and hasattr(pipeline_opts.ocr_options, 'reader'):
+                                        try:
+                                            del pipeline_opts.ocr_options.reader
+                                        except (AttributeError, Exception):
+                                            pass
+                    except Exception as e:
+                        logging.debug(f"Error cleaning converter internals: {e}")
+                    
                     logging.info(f"Unloading idle converter (cache_key: {cache_key}, idle for {idle_duration:.1f}s)")
                     del self._doc_converters[cache_key]
                     del self._last_used[cache_key]
+                    # Explicitly delete the converter object
+                    del converter
         
         # Force garbage collection to help free memory
         if idle_keys:
-            gc.collect()
+            # Multiple GC passes to ensure cleanup
+            for _ in range(5):  # Increased from 3 to 5
+                collected = gc.collect()
+                if collected == 0:
+                    break  # No more objects to collect
+            
             # Try to clear PyTorch cache if available
             try:
                 import torch
+                # Clear CPU cache (we're using CPU-only PyTorch)
+                if hasattr(torch, 'empty_cache'):
+                    torch.empty_cache()
+                # Also try CUDA cache in case it's available
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                    # Force synchronization
+                    torch.cuda.synchronize()
             except ImportError:
                 pass
             except Exception as e:
                 logging.debug(f"Could not clear PyTorch cache: {e}")
             
-            logging.info(f"Unloaded {len(idle_keys)} idle converter(s). Memory should be freed.")
+            # Try to clear EasyOCR global caches
+            # EasyOCR caches Reader objects which hold models in memory
+            try:
+                import easyocr
+                # EasyOCR may cache readers globally - try to clear module-level caches
+                if hasattr(easyocr, '__dict__'):
+                    # Clear any cached readers in the module
+                    keys_to_remove = []
+                    for key in easyocr.__dict__.keys():
+                        if 'reader' in key.lower() or 'cache' in key.lower() or 'model' in key.lower():
+                            keys_to_remove.append(key)
+                    for key in keys_to_remove:
+                        try:
+                            delattr(easyocr, key)
+                        except (AttributeError, Exception):
+                            pass
+                
+                # Also try to clear any cached readers in submodules
+                try:
+                    import easyocr.reader
+                    if hasattr(easyocr.reader, '__dict__'):
+                        for key in list(easyocr.reader.__dict__.keys()):
+                            if 'cache' in key.lower() or 'model' in key.lower():
+                                try:
+                                    delattr(easyocr.reader, key)
+                                except (AttributeError, Exception):
+                                    pass
+                except (ImportError, AttributeError, Exception):
+                    pass
+            except (ImportError, Exception) as e:
+                logging.debug(f"Could not clear EasyOCR cache: {e}")
+            
+            # Try to clear HuggingFace cache
+            try:
+                import transformers
+                # Clear transformers cache if possible
+                if hasattr(transformers, 'modeling_utils'):
+                    # Force clear any cached models
+                    pass
+            except (ImportError, Exception):
+                pass
+            
+            memory_after = self._get_memory_usage_mb()
+            memory_freed = memory_before - memory_after
+            logging.info(
+                f"Unloaded {len(idle_keys)} idle converter(s). "
+                f"Memory: {memory_before:.1f}MB -> {memory_after:.1f}MB "
+                f"(freed: {memory_freed:.1f}MB)"
+            )
         
         # Schedule next cleanup check
         self._schedule_cleanup()
@@ -151,9 +268,29 @@ class DoclingDocumentConversion(DocumentConversionBase):
     
     def cleanup_all(self):
         """Force cleanup of all converters (useful for shutdown or manual cleanup)."""
+        memory_before = self._get_memory_usage_mb()
+        
         with self._lock:
             count = len(self._doc_converters)
             if count > 0:
+                # Explicitly clean up each converter before deletion
+                for cache_key, converter in list(self._doc_converters.items()):
+                    try:
+                        # Try to clean up converter internals
+                        if hasattr(converter, '_pipelines'):
+                            converter._pipelines.clear()
+                        if hasattr(converter, '_format_options'):
+                            for fmt_option in converter._format_options.values():
+                                if hasattr(fmt_option, 'pipeline_options'):
+                                    pipeline_opts = fmt_option.pipeline_options
+                                    if hasattr(pipeline_opts, 'ocr_options') and hasattr(pipeline_opts.ocr_options, 'reader'):
+                                        try:
+                                            del pipeline_opts.ocr_options.reader
+                                        except (AttributeError, Exception):
+                                            pass
+                    except Exception as e:
+                        logging.debug(f"Error cleaning converter {cache_key}: {e}")
+                
                 logging.info(f"Force unloading {count} converter(s)")
                 self._doc_converters.clear()
                 self._last_used.clear()
@@ -162,14 +299,40 @@ class DoclingDocumentConversion(DocumentConversionBase):
                 self._cleanup_timer.cancel()
                 self._cleanup_timer = None
         
-        # Force garbage collection
-        gc.collect()
+        # Force garbage collection (multiple passes)
+        for _ in range(5):
+            collected = gc.collect()
+            if collected == 0:
+                break
+        
+        # Clear PyTorch caches
         try:
             import torch
+            if hasattr(torch, 'empty_cache'):
+                torch.empty_cache()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                torch.cuda.synchronize()
         except (ImportError, Exception):
             pass
+        
+        # Clear EasyOCR global caches
+        try:
+            import easyocr
+            if hasattr(easyocr, '__dict__'):
+                for key in list(easyocr.__dict__.keys()):
+                    if 'reader' in key.lower() or 'cache' in key.lower():
+                        try:
+                            delattr(easyocr, key)
+                        except (AttributeError, Exception):
+                            pass
+        except (ImportError, Exception):
+            pass
+        
+        memory_after = self._get_memory_usage_mb()
+        memory_freed = memory_before - memory_after
+        logging.info(f"Cleanup complete. Memory: {memory_before:.1f}MB -> {memory_after:.1f}MB (freed: {memory_freed:.1f}MB)")
 
     def _update_pipeline_options(self, extract_tables: bool, image_resolution_scale: int) -> PdfPipelineOptions:
         self.pipeline_options.images_scale = image_resolution_scale
@@ -269,10 +432,17 @@ class DoclingDocumentConversion(DocumentConversionBase):
 
 
 class DocumentConverterService:
-    def __init__(self, document_converter: DocumentConversionBase):
+    def __init__(self, document_converter: Optional[DocumentConversionBase] = None):
         self.document_converter = document_converter
 
     def convert_document(self, document: Tuple[str, BytesIO], **kwargs) -> ConversionResult:
+        mode = os.getenv("CONVERSION_MODE", DEFAULT_CONVERSION_MODE).lower()
+        if mode == "process":
+            return self._convert_document_via_worker(document, **kwargs)
+
+        if self.document_converter is None:
+            raise HTTPException(status_code=500, detail="Document converter not initialized")
+
         result = self.document_converter.convert(document, **kwargs)
         if result.error:
             logging.error(f"Failed to convert {document[0]}: {result.error}")
@@ -280,4 +450,117 @@ class DocumentConverterService:
         return result
 
     def convert_documents(self, documents: List[Tuple[str, BytesIO]], **kwargs) -> List[ConversionResult]:
+        mode = os.getenv("CONVERSION_MODE", DEFAULT_CONVERSION_MODE).lower()
+        if mode == "process":
+            return self._convert_documents_via_worker(documents, **kwargs)
+
+        if self.document_converter is None:
+            raise HTTPException(status_code=500, detail="Document converter not initialized")
+
         return self.document_converter.convert_batch(documents, **kwargs)
+
+    @staticmethod
+    def _repo_root_dir() -> Path:
+        # docling-fast-api/document_converter/service.py -> docling-fast-api/
+        return Path(__file__).resolve().parents[1]
+
+    def _run_worker(self, args: List[str]) -> str:
+        timeout = int(os.getenv("WORKER_TIMEOUT_SECONDS", str(DEFAULT_WORKER_TIMEOUT_SECONDS)))
+        cmd = [sys.executable, "-m", "document_converter.worker", *args]
+        proc = subprocess.run(
+            cmd,
+            cwd=str(self._repo_root_dir()),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            # Include stderr to make debugging deploy issues easy
+            raise HTTPException(
+                status_code=500,
+                detail=f"Worker failed (exit={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}",
+            )
+        return proc.stdout
+
+    def _convert_document_via_worker(self, document: Tuple[str, BytesIO], **kwargs) -> ConversionResult:
+        filename, fileobj = document
+        extract_tables = bool(kwargs.get("extract_tables", False))
+        image_resolution_scale = int(kwargs.get("image_resolution_scale", IMAGE_RESOLUTION_SCALE))
+
+        tmp_path = None
+        try:
+            suffix = Path(filename).suffix or ".bin"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+                tmp_path = f.name
+                fileobj.seek(0)
+                f.write(fileobj.read())
+
+            out = self._run_worker(
+                [
+                    "--mode",
+                    "single",
+                    "--input-path",
+                    tmp_path,
+                    "--filename",
+                    filename,
+                    "--extract-tables",
+                    "true" if extract_tables else "false",
+                    "--image-scale",
+                    str(image_resolution_scale),
+                ]
+            )
+            payload = json.loads(out)
+            return ConversionResult(**payload)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _convert_documents_via_worker(self, documents: List[Tuple[str, BytesIO]], **kwargs) -> List[ConversionResult]:
+        extract_tables = bool(kwargs.get("extract_tables", False))
+        image_resolution_scale = int(kwargs.get("image_resolution_scale", IMAGE_RESOLUTION_SCALE))
+
+        tmp_dir = None
+        batch_json_path = None
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="docling_batch_")
+            batch = []
+
+            for idx, (filename, fileobj) in enumerate(documents):
+                suffix = Path(filename).suffix or ".bin"
+                p = Path(tmp_dir) / f"input_{idx}{suffix}"
+                fileobj.seek(0)
+                p.write_bytes(fileobj.read())
+                batch.append({"filename": filename, "path": str(p)})
+
+            batch_json_path = str(Path(tmp_dir) / "batch.json")
+            Path(batch_json_path).write_text(json.dumps(batch))
+
+            out = self._run_worker(
+                [
+                    "--mode",
+                    "batch",
+                    "--batch-json-path",
+                    batch_json_path,
+                    "--extract-tables",
+                    "true" if extract_tables else "false",
+                    "--image-scale",
+                    str(image_resolution_scale),
+                ]
+            )
+            payload = json.loads(out)
+            return [ConversionResult(**item) for item in payload]
+        finally:
+            # Best-effort cleanup of temp files/dir
+            if tmp_dir:
+                try:
+                    for child in Path(tmp_dir).glob("*"):
+                        try:
+                            child.unlink()
+                        except OSError:
+                            pass
+                    Path(tmp_dir).rmdir()
+                except OSError:
+                    pass
