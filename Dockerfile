@@ -55,4 +55,4 @@ COPY . .
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["sh", "-c", "uvicorn --port ${PORT:-8080} --host 0.0.0.0 main:app"]
+CMD ["sh", "-c", "uvicorn --port ${PORT:-8080} --host 0.0.0.0 --workers ${WEB_CONCURRENCY:-1} main:app"]

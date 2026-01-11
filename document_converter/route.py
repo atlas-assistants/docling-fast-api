@@ -47,6 +47,7 @@ def get_service():
 async def convert_single_document(
     document: UploadFile = File(...),
     extract_tables_as_images: bool = False,
+    include_images: bool = False,
     image_resolution_scale: int = Query(4, ge=1, le=4),
 ):
     file_bytes = await document.read()
@@ -56,6 +57,7 @@ async def convert_single_document(
     return get_service().convert_document(
         (document.filename, BytesIO(file_bytes)),
         extract_tables=extract_tables_as_images,
+        include_images=include_images,
         image_resolution_scale=image_resolution_scale,
     )
 
@@ -69,6 +71,7 @@ async def convert_single_document(
 async def convert_multiple_documents(
     documents: List[UploadFile] = File(...),
     extract_tables_as_images: bool = False,
+    include_images: bool = False,
     image_resolution_scale: int = Query(4, ge=1, le=4),
 ):
     doc_streams = []
@@ -81,5 +84,6 @@ async def convert_multiple_documents(
     return get_service().convert_documents(
         doc_streams,
         extract_tables=extract_tables_as_images,
+        include_images=include_images,
         image_resolution_scale=image_resolution_scale,
     )

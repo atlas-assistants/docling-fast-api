@@ -10,13 +10,9 @@ import time
 from abc import ABC, abstractmethod
 from io import BytesIO
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, TYPE_CHECKING, Any
 from threading import Lock, Timer
 
-from docling.datamodel.base_models import InputFormat, DocumentStream
-from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions
-from docling.document_converter import PdfFormatOption, DocumentConverter
-from docling_core.types.doc import ImageRefMode, TableItem, PictureItem
 from fastapi import HTTPException
 
 from document_converter.schema import ConversionResult, ImageData
@@ -34,6 +30,11 @@ DEFAULT_IDLE_TIMEOUT_SECONDS = 300
 # - "process": run Docling in a short-lived worker subprocess (serverless-like memory reclaim)
 DEFAULT_CONVERSION_MODE = "inprocess"
 DEFAULT_WORKER_TIMEOUT_SECONDS = 300
+
+if TYPE_CHECKING:
+    # Heavy imports only for type-checking. Runtime imports happen lazily in methods.
+    from docling.datamodel.pipeline_options import PdfPipelineOptions  # pragma: no cover
+    from docling.document_converter import DocumentConverter  # pragma: no cover
 
 
 class DocumentConversionBase(ABC):
@@ -66,7 +67,7 @@ class DoclingDocumentConversion(DocumentConversionBase):
         ```
     """
 
-    def __init__(self, pipeline_options: PdfPipelineOptions = None, idle_timeout_seconds: int = DEFAULT_IDLE_TIMEOUT_SECONDS):
+    def __init__(self, pipeline_options: "PdfPipelineOptions" = None, idle_timeout_seconds: int = DEFAULT_IDLE_TIMEOUT_SECONDS):
         self.pipeline_options = pipeline_options if pipeline_options else self._setup_default_pipeline_options()
         # Cache DocumentConverter instances by their option signature to reuse across requests
         # This prevents creating new converter instances on every request.
@@ -78,10 +79,16 @@ class DoclingDocumentConversion(DocumentConversionBase):
         self._cleanup_timer: Optional[Timer] = None
         self._schedule_cleanup()
 
-    def _get_doc_converter(self, extract_tables: bool, image_resolution_scale: int) -> DocumentConverter:
+    def _get_doc_converter(self, extract_tables: bool, include_images: bool, image_resolution_scale: int) -> "DocumentConverter":
         """Get or create a DocumentConverter instance with request-specific options."""
+        # Lazy imports to keep API process light when CONVERSION_MODE=process
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.document_converter import PdfFormatOption, DocumentConverter
+
         # Create a cache key based on the variable options
-        cache_key = (extract_tables, image_resolution_scale)
+        # Note: include_images affects whether Docling generates image objects at all.
+        cache_key = (extract_tables, include_images, image_resolution_scale)
         current_time = time.time()
         
         # Check if we already have a converter for these options
@@ -93,10 +100,11 @@ class DoclingDocumentConversion(DocumentConversionBase):
         # Create pipeline options for this specific request
         pipeline_options = PdfPipelineOptions()
         pipeline_options.generate_page_images = self.pipeline_options.generate_page_images
-        pipeline_options.generate_picture_images = self.pipeline_options.generate_picture_images
+        # Avoid generating picture/table images unless explicitly requested.
+        pipeline_options.generate_picture_images = bool(include_images)
         pipeline_options.ocr_options = self.pipeline_options.ocr_options
         pipeline_options.images_scale = image_resolution_scale
-        pipeline_options.generate_table_images = extract_tables
+        pipeline_options.generate_table_images = bool(include_images and extract_tables)
         
         # Create converter with thread-safety
         # The ML models are loaded once and cached globally, so even if we create
@@ -340,7 +348,10 @@ class DoclingDocumentConversion(DocumentConversionBase):
         return self.pipeline_options
 
     @staticmethod
-    def _setup_default_pipeline_options() -> PdfPipelineOptions:
+    def _setup_default_pipeline_options() -> "PdfPipelineOptions":
+        # Lazy import
+        from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions
+
         pipeline_options = PdfPipelineOptions()
         pipeline_options.generate_page_images = False
         pipeline_options.generate_picture_images = True
@@ -349,11 +360,18 @@ class DoclingDocumentConversion(DocumentConversionBase):
         return pipeline_options
 
     @staticmethod
-    def _process_document_images(conv_res) -> Tuple[str, List[ImageData]]:
+    def _process_document_images(conv_res: Any, include_images: bool) -> Tuple[str, List[ImageData]]:
+        # Lazy import
+        from docling_core.types.doc import ImageRefMode, TableItem, PictureItem
+
         images = []
         table_counter = 0
         picture_counter = 0
+        # Always export markdown with placeholders; we optionally embed images below.
         content_md = conv_res.document.export_to_markdown(image_mode=ImageRefMode.PLACEHOLDER)
+
+        if not include_images:
+            return content_md, []
 
         for element, _level in conv_res.document.iterate_items():
             if isinstance(element, (TableItem, PictureItem)) and element.image:
@@ -379,12 +397,16 @@ class DoclingDocumentConversion(DocumentConversionBase):
         self,
         document: Tuple[str, BytesIO],
         extract_tables: bool = False,
+        include_images: bool = False,
         image_resolution_scale: int = IMAGE_RESOLUTION_SCALE,
     ) -> ConversionResult:
+        # Lazy import
+        from docling.datamodel.base_models import DocumentStream
+
         filename, file = document
         # Get converter (will load models if needed, or reuse existing)
         # Models will be automatically unloaded after idle timeout
-        doc_converter = self._get_doc_converter(extract_tables, image_resolution_scale)
+        doc_converter = self._get_doc_converter(extract_tables, include_images, image_resolution_scale)
 
         if filename.lower().endswith('.csv'):
             file, error = handle_csv_file(file)
@@ -398,18 +420,22 @@ class DoclingDocumentConversion(DocumentConversionBase):
             logging.error(f"Failed to convert {filename}: {conv_res.errors[0].error_message}")
             return ConversionResult(filename=doc_filename, error=conv_res.errors[0].error_message)
 
-        content_md, images = self._process_document_images(conv_res)
+        content_md, images = self._process_document_images(conv_res, include_images=include_images)
         return ConversionResult(filename=doc_filename, markdown=content_md, images=images)
 
     def convert_batch(
         self,
         documents: List[Tuple[str, BytesIO]],
         extract_tables: bool = False,
+        include_images: bool = False,
         image_resolution_scale: int = IMAGE_RESOLUTION_SCALE,
     ) -> List[ConversionResult]:
+        # Lazy import
+        from docling.datamodel.base_models import DocumentStream
+
         # Get converter (will load models if needed, or reuse existing)
         # Models will be automatically unloaded after idle timeout
-        doc_converter = self._get_doc_converter(extract_tables, image_resolution_scale)
+        doc_converter = self._get_doc_converter(extract_tables, include_images, image_resolution_scale)
 
         conv_results = doc_converter.convert_all(
             [DocumentStream(name=filename, stream=file) for filename, file in documents],
@@ -425,7 +451,7 @@ class DoclingDocumentConversion(DocumentConversionBase):
                 results.append(ConversionResult(filename=conv_res.input.name, error=conv_res.errors[0].error_message))
                 continue
 
-            content_md, images = self._process_document_images(conv_res)
+            content_md, images = self._process_document_images(conv_res, include_images=include_images)
             results.append(ConversionResult(filename=doc_filename, markdown=content_md, images=images))
 
         return results
@@ -467,6 +493,7 @@ class DocumentConverterService:
     def _run_worker(self, args: List[str]) -> str:
         timeout = int(os.getenv("WORKER_TIMEOUT_SECONDS", str(DEFAULT_WORKER_TIMEOUT_SECONDS)))
         cmd = [sys.executable, "-m", "document_converter.worker", *args]
+        logging.info(f"CONVERSION_MODE=process: spawning worker subprocess: {' '.join(cmd)}")
         proc = subprocess.run(
             cmd,
             cwd=str(self._repo_root_dir()),
@@ -480,11 +507,13 @@ class DocumentConverterService:
                 status_code=500,
                 detail=f"Worker failed (exit={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}",
             )
+        logging.info("CONVERSION_MODE=process: worker subprocess completed successfully")
         return proc.stdout
 
     def _convert_document_via_worker(self, document: Tuple[str, BytesIO], **kwargs) -> ConversionResult:
         filename, fileobj = document
         extract_tables = bool(kwargs.get("extract_tables", False))
+        include_images = bool(kwargs.get("include_images", False))
         image_resolution_scale = int(kwargs.get("image_resolution_scale", IMAGE_RESOLUTION_SCALE))
 
         tmp_path = None
@@ -505,6 +534,8 @@ class DocumentConverterService:
                     filename,
                     "--extract-tables",
                     "true" if extract_tables else "false",
+                    "--include-images",
+                    "true" if include_images else "false",
                     "--image-scale",
                     str(image_resolution_scale),
                 ]
@@ -520,6 +551,7 @@ class DocumentConverterService:
 
     def _convert_documents_via_worker(self, documents: List[Tuple[str, BytesIO]], **kwargs) -> List[ConversionResult]:
         extract_tables = bool(kwargs.get("extract_tables", False))
+        include_images = bool(kwargs.get("include_images", False))
         image_resolution_scale = int(kwargs.get("image_resolution_scale", IMAGE_RESOLUTION_SCALE))
 
         tmp_dir = None
@@ -546,6 +578,8 @@ class DocumentConverterService:
                     batch_json_path,
                     "--extract-tables",
                     "true" if extract_tables else "false",
+                    "--include-images",
+                    "true" if include_images else "false",
                     "--image-scale",
                     str(image_resolution_scale),
                 ]

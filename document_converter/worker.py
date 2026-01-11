@@ -17,6 +17,7 @@ def main() -> int:
 
     parser.add_argument("--mode", choices=["single", "batch"], required=True)
     parser.add_argument("--extract-tables", type=_bool_arg, default=False)
+    parser.add_argument("--include-images", type=_bool_arg, default=False)
     parser.add_argument("--image-scale", type=int, default=4)
 
     # single
@@ -39,6 +40,7 @@ def main() -> int:
         res = converter.convert(
             (args.filename, BytesIO(file_bytes)),
             extract_tables=args.extract_tables,
+            include_images=args.include_images,
             image_resolution_scale=args.image_scale,
         )
         payload = res.model_dump() if hasattr(res, "model_dump") else res.dict()
@@ -58,6 +60,7 @@ def main() -> int:
     results = converter.convert_batch(
         documents,
         extract_tables=args.extract_tables,
+        include_images=args.include_images,
         image_resolution_scale=args.image_scale,
     )
     payload = [
