@@ -22,7 +22,7 @@ def get_converter():
     global _converter
     mode = os.getenv("CONVERSION_MODE", DEFAULT_CONVERSION_MODE).lower()
     # In worker-process mode, keep Docling out of the API process entirely.
-    if mode == "process":
+    if mode in ("process", "pool"):
         return None
     if _converter is None:
         # Get idle timeout from environment variable (default: 5 minutes)

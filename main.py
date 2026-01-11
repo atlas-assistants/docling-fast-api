@@ -6,13 +6,18 @@ import ctypes
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from document_converter.route import router as document_converter_router, get_converter
+from document_converter.route import router as document_converter_router, get_converter, get_service
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: nothing needed
     yield
+    # Shutdown: stop persistent worker (pool mode) if running
+    try:
+        get_service().pool_shutdown()
+    except Exception:
+        pass
     # Shutdown: cleanup converters to free memory
     converter = get_converter()
     if converter is not None and hasattr(converter, 'cleanup_all'):

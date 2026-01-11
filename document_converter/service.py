@@ -32,6 +32,7 @@ DEFAULT_IDLE_TIMEOUT_SECONDS = 300
 # - "process": run Docling in a short-lived worker subprocess (serverless-like memory reclaim)
 DEFAULT_CONVERSION_MODE = "inprocess"
 DEFAULT_WORKER_TIMEOUT_SECONDS = 300
+DEFAULT_WORKER_IDLE_TIMEOUT_SECONDS = 300
 
 if TYPE_CHECKING:
     # Heavy imports only for type-checking. Runtime imports happen lazily in methods.
@@ -74,8 +75,9 @@ class DoclingDocumentConversion(DocumentConversionBase):
         # Cache DocumentConverter instances by their option signature to reuse across requests
         # This prevents creating new converter instances on every request.
         # Models will be unloaded after idle_timeout_seconds of inactivity (serverless-like behavior)
-        self._doc_converters = {}  # Cache keyed by (extract_tables, image_resolution_scale)
-        self._last_used = {}  # Track last usage time for each converter
+        self._doc_converters = {}  # Cache keyed by (extract_tables, include_images, image_resolution_scale)
+        self._last_used = {}  # Track last usage time for each converter (updated on access and after conversion)
+        self._active_counts = {}  # Track in-flight conversions per converter key to avoid unloading while in use
         self._lock = Lock()
         self._idle_timeout = idle_timeout_seconds
         self._cleanup_timer: Optional[Timer] = None
@@ -152,39 +154,22 @@ class DoclingDocumentConversion(DocumentConversionBase):
         with self._lock:
             for cache_key, last_used in list(self._last_used.items()):
                 idle_duration = current_time - last_used
+                active = int(self._active_counts.get(cache_key, 0))
+                # Never unload a converter that's currently in use (prevents mid-conversion races)
+                if active > 0:
+                    continue
                 if idle_duration > self._idle_timeout:
                     idle_keys.append(cache_key)
             
-            # Remove idle converters and try to explicitly clean up their internal state
+            # Remove idle converters
             for cache_key in idle_keys:
                 if cache_key in self._doc_converters:
-                    converter = self._doc_converters[cache_key]
-                    idle_duration = current_time - self._last_used[cache_key]
-                    
-                    # Try to explicitly clean up converter's internal state
-                    try:
-                        # Docling converters may have internal pipeline objects
-                        if hasattr(converter, '_pipelines'):
-                            converter._pipelines.clear()
-                        if hasattr(converter, '_format_options'):
-                            # Clear format options which may hold model references
-                            for fmt_option in converter._format_options.values():
-                                if hasattr(fmt_option, 'pipeline_options'):
-                                    pipeline_opts = fmt_option.pipeline_options
-                                    # Try to clear OCR reader if it exists
-                                    if hasattr(pipeline_opts, 'ocr_options') and hasattr(pipeline_opts.ocr_options, 'reader'):
-                                        try:
-                                            del pipeline_opts.ocr_options.reader
-                                        except (AttributeError, Exception):
-                                            pass
-                    except Exception as e:
-                        logging.debug(f"Error cleaning converter internals: {e}")
-                    
+                    idle_duration = current_time - float(self._last_used.get(cache_key, current_time))
                     logging.info(f"Unloading idle converter (cache_key: {cache_key}, idle for {idle_duration:.1f}s)")
                     del self._doc_converters[cache_key]
                     del self._last_used[cache_key]
-                    # Explicitly delete the converter object
-                    del converter
+                    if cache_key in self._active_counts:
+                        del self._active_counts[cache_key]
         
         # Force garbage collection to help free memory
         if idle_keys:
@@ -211,47 +196,10 @@ class DoclingDocumentConversion(DocumentConversionBase):
             except Exception as e:
                 logging.debug(f"Could not clear PyTorch cache: {e}")
             
-            # Try to clear EasyOCR global caches
-            # EasyOCR caches Reader objects which hold models in memory
-            try:
-                import easyocr
-                # EasyOCR may cache readers globally - try to clear module-level caches
-                if hasattr(easyocr, '__dict__'):
-                    # Clear any cached readers in the module
-                    keys_to_remove = []
-                    for key in easyocr.__dict__.keys():
-                        if 'reader' in key.lower() or 'cache' in key.lower() or 'model' in key.lower():
-                            keys_to_remove.append(key)
-                    for key in keys_to_remove:
-                        try:
-                            delattr(easyocr, key)
-                        except (AttributeError, Exception):
-                            pass
-                
-                # Also try to clear any cached readers in submodules
-                try:
-                    import easyocr.reader
-                    if hasattr(easyocr.reader, '__dict__'):
-                        for key in list(easyocr.reader.__dict__.keys()):
-                            if 'cache' in key.lower() or 'model' in key.lower():
-                                try:
-                                    delattr(easyocr.reader, key)
-                                except (AttributeError, Exception):
-                                    pass
-                except (ImportError, AttributeError, Exception):
-                    pass
-            except (ImportError, Exception) as e:
-                logging.debug(f"Could not clear EasyOCR cache: {e}")
-            
-            # Try to clear HuggingFace cache
-            try:
-                import transformers
-                # Clear transformers cache if possible
-                if hasattr(transformers, 'modeling_utils'):
-                    # Force clear any cached models
-                    pass
-            except (ImportError, Exception):
-                pass
+            # Note: we intentionally do NOT attempt to mutate internal docling/easyocr
+            # objects here; that can cause hard-to-reproduce crashes. In-process mode
+            # is best-effort for RSS reduction; use CONVERSION_MODE=pool/process for
+            # deterministic OS-level memory reclaim.
             
             memory_after = self._get_memory_usage_mb()
             memory_freed = memory_before - memory_after
@@ -408,14 +356,25 @@ class DoclingDocumentConversion(DocumentConversionBase):
         filename, file = document
         # Get converter (will load models if needed, or reuse existing)
         # Models will be automatically unloaded after idle timeout
+        cache_key = (extract_tables, include_images, image_resolution_scale)
         doc_converter = self._get_doc_converter(extract_tables, include_images, image_resolution_scale)
+        with self._lock:
+            self._active_counts[cache_key] = int(self._active_counts.get(cache_key, 0)) + 1
 
         if filename.lower().endswith('.csv'):
             file, error = handle_csv_file(file)
             if error:
+                with self._lock:
+                    self._active_counts[cache_key] = max(0, int(self._active_counts.get(cache_key, 1)) - 1)
                 return ConversionResult(filename=filename, error=error)
 
-        conv_res = doc_converter.convert(DocumentStream(name=filename, stream=file), raises_on_error=False)
+        try:
+            conv_res = doc_converter.convert(DocumentStream(name=filename, stream=file), raises_on_error=False)
+        finally:
+            with self._lock:
+                self._active_counts[cache_key] = max(0, int(self._active_counts.get(cache_key, 1)) - 1)
+                # Touch last-used on completion so long conversions don't look "idle"
+                self._last_used[cache_key] = time.time()
         doc_filename = conv_res.input.file.stem
 
         if conv_res.errors:
@@ -437,12 +396,20 @@ class DoclingDocumentConversion(DocumentConversionBase):
 
         # Get converter (will load models if needed, or reuse existing)
         # Models will be automatically unloaded after idle timeout
+        cache_key = (extract_tables, include_images, image_resolution_scale)
         doc_converter = self._get_doc_converter(extract_tables, include_images, image_resolution_scale)
+        with self._lock:
+            self._active_counts[cache_key] = int(self._active_counts.get(cache_key, 0)) + 1
 
-        conv_results = doc_converter.convert_all(
-            [DocumentStream(name=filename, stream=file) for filename, file in documents],
-            raises_on_error=False,
-        )
+        try:
+            conv_results = doc_converter.convert_all(
+                [DocumentStream(name=filename, stream=file) for filename, file in documents],
+                raises_on_error=False,
+            )
+        finally:
+            with self._lock:
+                self._active_counts[cache_key] = max(0, int(self._active_counts.get(cache_key, 1)) - 1)
+                self._last_used[cache_key] = time.time()
 
         results = []
         for conv_res in conv_results:
@@ -462,11 +429,17 @@ class DoclingDocumentConversion(DocumentConversionBase):
 class DocumentConverterService:
     def __init__(self, document_converter: Optional[DocumentConversionBase] = None):
         self.document_converter = document_converter
+        self._pool_lock = Lock()
+        self._pool_proc: Optional[subprocess.Popen[str]] = None
+        self._pool_last_used: float = 0.0
+        self._pool_idle_timer: Optional[Timer] = None
 
     def convert_document(self, document: Tuple[str, BytesIO], **kwargs) -> ConversionResult:
         mode = os.getenv("CONVERSION_MODE", DEFAULT_CONVERSION_MODE).lower()
         if mode == "process":
             return self._convert_document_via_worker(document, **kwargs)
+        if mode == "pool":
+            return self._convert_document_via_pool(document, **kwargs)
 
         if self.document_converter is None:
             raise HTTPException(status_code=500, detail="Document converter not initialized")
@@ -481,6 +454,8 @@ class DocumentConverterService:
         mode = os.getenv("CONVERSION_MODE", DEFAULT_CONVERSION_MODE).lower()
         if mode == "process":
             return self._convert_documents_via_worker(documents, **kwargs)
+        if mode == "pool":
+            return self._convert_documents_via_pool(documents, **kwargs)
 
         if self.document_converter is None:
             raise HTTPException(status_code=500, detail="Document converter not initialized")
@@ -511,6 +486,196 @@ class DocumentConverterService:
             )
         logging.info("CONVERSION_MODE=process: worker subprocess completed successfully")
         return proc.stdout
+
+    def _pool_idle_timeout(self) -> int:
+        return int(os.getenv("WORKER_IDLE_TIMEOUT_SECONDS", str(DEFAULT_WORKER_IDLE_TIMEOUT_SECONDS)))
+
+    def _pool_ensure_started(self) -> None:
+        if self._pool_proc is not None and self._pool_proc.poll() is None:
+            return
+
+        cmd = [sys.executable, "-m", "document_converter.worker", "--mode", "serve"]
+        logging.info(f"CONVERSION_MODE=pool: starting persistent worker: {' '.join(cmd)}")
+        self._pool_proc = subprocess.Popen(
+            cmd,
+            cwd=str(self._repo_root_dir()),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,  # line-buffered
+        )
+        self._pool_last_used = time.time()
+        self._pool_schedule_idle_kill()
+
+    def _pool_kill(self) -> None:
+        proc = self._pool_proc
+        self._pool_proc = None
+        self._pool_last_used = 0.0
+        if self._pool_idle_timer is not None:
+            try:
+                self._pool_idle_timer.cancel()
+            except Exception:
+                pass
+            self._pool_idle_timer = None
+
+        if proc is None:
+            return
+
+        try:
+            logging.info("CONVERSION_MODE=pool: stopping persistent worker (idle)")
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        except Exception:
+            pass
+
+    def _pool_schedule_idle_kill(self) -> None:
+        # Cancel & reschedule a timer that kills the worker if idle for WORKER_IDLE_TIMEOUT_SECONDS.
+        if self._pool_idle_timer is not None:
+            try:
+                self._pool_idle_timer.cancel()
+            except Exception:
+                pass
+            self._pool_idle_timer = None
+
+        idle_timeout = self._pool_idle_timeout()
+
+        def _check():
+            with self._pool_lock:
+                if self._pool_proc is None:
+                    return
+                if (time.time() - self._pool_last_used) >= idle_timeout:
+                    self._pool_kill()
+                    return
+                # still in use recently, reschedule
+                self._pool_schedule_idle_kill()
+
+        self._pool_idle_timer = Timer(30, _check)
+        self._pool_idle_timer.daemon = True
+        self._pool_idle_timer.start()
+
+    def pool_shutdown(self) -> None:
+        # Called on app shutdown.
+        with self._pool_lock:
+            self._pool_kill()
+
+    def _pool_request(self, payload: dict) -> Any:
+        timeout = int(os.getenv("WORKER_TIMEOUT_SECONDS", str(DEFAULT_WORKER_TIMEOUT_SECONDS)))
+        with self._pool_lock:
+            self._pool_ensure_started()
+            assert self._pool_proc is not None
+            assert self._pool_proc.stdin is not None
+            assert self._pool_proc.stdout is not None
+
+            self._pool_last_used = time.time()
+            self._pool_schedule_idle_kill()
+
+            try:
+                self._pool_proc.stdin.write(json.dumps(payload) + "\n")
+                self._pool_proc.stdin.flush()
+            except Exception as e:
+                # Worker stdin broken — restart once
+                self._pool_kill()
+                raise HTTPException(status_code=500, detail=f"Worker pipe broken: {e}")
+
+            # Read one line response
+            start = time.time()
+            while True:
+                if (time.time() - start) > timeout:
+                    self._pool_kill()
+                    raise HTTPException(status_code=504, detail="Worker timed out")
+                line = self._pool_proc.stdout.readline()
+                if not line:
+                    # Worker exited
+                    stderr = ""
+                    try:
+                        if self._pool_proc.stderr is not None:
+                            stderr = self._pool_proc.stderr.read()[-2000:]
+                    except Exception:
+                        pass
+                    self._pool_kill()
+                    raise HTTPException(status_code=500, detail=f"Worker exited unexpectedly. {stderr}")
+                line = line.strip()
+                if not line:
+                    continue
+                resp = json.loads(line)
+                if not resp.get("ok"):
+                    err = resp.get("error") or "Worker error"
+                    raise HTTPException(status_code=500, detail=err)
+                return resp.get("result")
+
+    def _convert_document_via_pool(self, document: Tuple[str, BytesIO], **kwargs) -> ConversionResult:
+        filename, fileobj = document
+        extract_tables = bool(kwargs.get("extract_tables", False))
+        include_images = bool(kwargs.get("include_images", False))
+        image_resolution_scale = int(kwargs.get("image_resolution_scale", IMAGE_RESOLUTION_SCALE))
+
+        tmp_path = None
+        try:
+            suffix = Path(filename).suffix or ".bin"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+                tmp_path = f.name
+                fileobj.seek(0)
+                f.write(fileobj.read())
+
+            result = self._pool_request(
+                {
+                    "mode": "single",
+                    "input_path": tmp_path,
+                    "filename": filename,
+                    "extract_tables": extract_tables,
+                    "include_images": include_images,
+                    "image_scale": image_resolution_scale,
+                }
+            )
+            return ConversionResult(**result)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _convert_documents_via_pool(self, documents: List[Tuple[str, BytesIO]], **kwargs) -> List[ConversionResult]:
+        extract_tables = bool(kwargs.get("extract_tables", False))
+        include_images = bool(kwargs.get("include_images", False))
+        image_resolution_scale = int(kwargs.get("image_resolution_scale", IMAGE_RESOLUTION_SCALE))
+
+        tmp_dir = None
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="docling_batch_")
+            batch = []
+            for idx, (filename, fileobj) in enumerate(documents):
+                suffix = Path(filename).suffix or ".bin"
+                p = Path(tmp_dir) / f"input_{idx}{suffix}"
+                fileobj.seek(0)
+                p.write_bytes(fileobj.read())
+                batch.append({"filename": filename, "path": str(p)})
+
+            result = self._pool_request(
+                {
+                    "mode": "batch",
+                    "batch": batch,
+                    "extract_tables": extract_tables,
+                    "include_images": include_images,
+                    "image_scale": image_resolution_scale,
+                }
+            )
+            return [ConversionResult(**item) for item in result]
+        finally:
+            if tmp_dir:
+                try:
+                    for child in Path(tmp_dir).glob("*"):
+                        try:
+                            child.unlink()
+                        except OSError:
+                            pass
+                    Path(tmp_dir).rmdir()
+                except OSError:
+                    pass
 
     def _convert_document_via_worker(self, document: Tuple[str, BytesIO], **kwargs) -> ConversionResult:
         filename, fileobj = document

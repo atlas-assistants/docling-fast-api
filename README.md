@@ -123,6 +123,21 @@ curl -X POST "http://localhost:8080/documents/batch-convert" \
 
 - `image_resolution_scale`: Control the resolution of extracted images (1-4)
 - `extract_tables_as_images`: Extract tables as images (true/false)
+- `include_images`: Embed extracted images as base64 strings in the JSON response (true/false, default: false)
+
+## Memory / Worker modes
+
+Docling + OCR models can use multiple GB of RAM when loaded. You can choose how the server runs conversions:
+
+- **`CONVERSION_MODE=inprocess`** (default): runs Docling inside the API process.
+- **`CONVERSION_MODE=process`**: spawns a new worker subprocess per request (memory reclaimed when the worker exits).
+- **`CONVERSION_MODE=pool`**: keeps **one** persistent worker subprocess and reuses it for all requests, then kills it after an idle timeout.
+
+Related env vars:
+
+- **`WORKER_TIMEOUT_SECONDS`**: max seconds for a conversion before failing (default: 300)
+- **`WORKER_IDLE_TIMEOUT_SECONDS`**: only for `CONVERSION_MODE=pool`; kill the persistent worker after N seconds idle (default: 300)
+- **`ENABLE_MALLOC_TRIM`**: `1` to attempt to trim the API process heap after requests (Linux/glibc only; optional)
 
 ## Architecture
 
