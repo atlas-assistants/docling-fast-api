@@ -467,6 +467,7 @@ class DocumentConverterService:
     def _run_worker(self, args: List[str]) -> str:
         timeout = int(os.getenv("WORKER_TIMEOUT_SECONDS", str(DEFAULT_WORKER_TIMEOUT_SECONDS)))
         cmd = [sys.executable, "-m", "document_converter.worker", *args]
+        logging.info(f"CONVERSION_MODE=process: spawning worker subprocess: {' '.join(cmd)}")
         proc = subprocess.run(
             cmd,
             cwd=str(self._repo_root_dir()),
@@ -480,6 +481,7 @@ class DocumentConverterService:
                 status_code=500,
                 detail=f"Worker failed (exit={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}",
             )
+        logging.info("CONVERSION_MODE=process: worker subprocess completed successfully")
         return proc.stdout
 
     def _convert_document_via_worker(self, document: Tuple[str, BytesIO], **kwargs) -> ConversionResult:
